@@ -13,35 +13,42 @@
 
 | Niveau | Nb | Exemples clés |
 |--------|----|---------------|
-| Critique | 5 | Injection SQL via `$_SESSION['glpigroups']`, `eval()` sur `system_name`, ReDoS upload, SSTI, pré-auth SQLi (fixée) |
+| Critique | 2 | `eval()` sur `system_name` AssetDefinition (RCE admin), ReDoS upload via DocumentType |
 | Élevé | 7 | XSS plugin `getHistoryEntry()`, AJAX `innerHTML`, CSRF manquant, path traversal partiel |
 | Moyen | 6+ | Enumération documents, validation image faible, `exec()` git |
+| Latent / non-exploitable | 3 | SQLi `$_SESSION['glpigroups']`, `users_id = '$user'`, `$target/$user_table` — voir §2.1 corrigé |
 
-**Risque global** : la surface d'attaque post-authentification reste très large (plusieurs RCE chaînables via droits admin). La surface pré-auth a été significativement réduite par 11.0.5/11.0.6 mais quelques chemins restent fragiles.
+**Risque global** : la surface pré-auth est bien fermée sur 11.0.7 (aucune SQLi exploitable sans privilège identifiée par analyse statique). La surface admin reste large (RCE via `eval`, DoS upload). Les plugins tiers restent le principal angle d'attaque non couvert.
+
+**Important** : la revue ciblée du 2026-04-23 (4 agents sur unauth / low-priv Search / inventaire-API / patch-bypass) n'a **pas** permis d'écrire une PoC SQLi avec compte sans privilège ou sans authentification. Les CVE récentes (CVE-2026-26263, CVE-2025-24799, CVE-2022-35914) sont bien corrigées.
 
 ---
 
 ## 2. Vulnérabilités critiques identifiées dans 11.0.7
 
-### 2.1. Injection SQL via `$_SESSION['glpigroups']` non échappé
+### 2.1. [CORRIGÉ] Concaténation `$_SESSION['glpigroups']` — non-exploitable
 **Fichiers** : `src/ITILFollowup.php:1080,1105` — `src/Ticket.php:5632,5663,5686`
-**Type** : SQL Injection (CWE-89)
-**Sévérité** : **Critique** (contournement visibilité + éventuelle exfiltration)
+**Type** : code smell / defense-in-depth (pas SQLi exploitable)
+**Sévérité révisée** : **Information** (pas d'exploitabilité confirmée)
 
+Vérification de la source de `$_SESSION['glpigroups']` dans `src/Session.php:723-799` :
 ```php
-// src/Ticket.php:5632
-$groups = "'" . implode("','", $_SESSION['glpigroups']) . "'";
-// ...
-$group_query = "SELECT `tickets_id`
-  FROM `glpi_groups_tickets`
-  WHERE `groups_id` IN ($groups) AND type IN ($requester, $obs)";
+// Session.php:744-761 — peuplement depuis la base
+$iterator = $DB->request([
+    'SELECT'    => [Group_User::getTableField('groups_id'), ...],
+    'FROM'      => Group_User::getTable(),
+    'WHERE'     => ['users_id' => self::getLoginUserID(), ...],
+]);
+foreach ($iterator as $data) {
+    $_SESSION["glpigroups"][] = $data["groups_id"]; // INT auto-increment
+}
 ```
 
-Le tableau `$_SESSION['glpigroups']` est concaténé dans une requête SQL sans échappement, puis enveloppé dans `new QueryExpression(...)` côté `SearchProvider::constructSQL()` (ligne 1042-1054 de `SQLProvider.php`) — ce qui désactive l'échappement automatique (`@psalm-taint-escape sql`).
+`groups_id` est un entier auto-incrémenté de `glpi_groups.id`. **Aucun chemin user→session n'existe dans le core**. La concaténation reste un mauvais motif (defense-in-depth), mais elle n'est exploitable que si :
+- un plugin auth tiers peuple `$_SESSION['glpigroups']` depuis du user-input,
+- une RCE/SQLi préalable permet la manipulation de session (auquel cas cette SQLi devient superflue).
 
-**Impact** : si un attaquant arrive à influencer le contenu de `$_SESSION['glpigroups']` (via un LDAP forgé, un plugin, ou une autre chaîne d'auth), il injecte directement du SQL dans les recherches ticket/followup → bypass des restrictions de visibilité et potentiellement exfiltration inter-tenant.
-
-**Correction recommandée** : construire la clause via `DBmysqlIterator` ou caster/valider numériquement chaque ID :
+**Correction pertinente malgré tout** (hardening) :
 ```php
 $ids = array_map('intval', $_SESSION['glpigroups']);
 $groups = implode(',', $ids);
@@ -212,3 +219,40 @@ Si le bootstrap global n'impose pas auth + CSRF sur `/ajax/*`, un attaquant avec
 ---
 
 *Rapport généré le 2026-04-23 par analyse statique automatisée — certaines trouvailles requièrent une validation dynamique (PoC) pour confirmation d'exploitabilité.*
+
+---
+
+## 8. Revue ciblée "SQLi non-auth / bas-privilège" (addendum 2026-04-23)
+
+Deuxième passe avec 4 agents spécialisés, explicitement à la recherche d'une PoC SQLi exploitable sans authentification ou avec un compte self-service / technician.
+
+### 8.1. Surfaces analysées et verdict
+
+| Surface | Analyse | Verdict |
+|---------|---------|---------|
+| **Endpoints pré-auth** — `front/helpdesk.faq.php`, `front/document.send.php`, `front/login.php`, `front/lostpassword.php`, `ajax/fuzzysearch.php`, `ajax/treebrowse.php`, `ajax/getKnowbaseItemAnswer.php`, API RSQL `/api.php/v2.2/Knowledgebase/Article` | `KnowbaseItem::computeBooleanFullTextSearch()` strippe `+ - * ~ < > ( )` avant MATCH AGAINST. `Dropdown::getDropdownValue()` exige `Session::validateIDOR()`. RSQL passe par `DB::quoteName()` + PDO. `treebrowse.php` cast numérique strict. | **Aucune SQLi exploitable** |
+| **Moteur de recherche (compte self-service/technician)** — `ajax/search.php` avec `sort`, `order`, `criteria[X][field/searchtype/value]`, méta-critères, `itemtype` | `SQLProvider.php:4114-4116` valide les IDs de sort contre `SearchOption::getOptionsForItemtype()` ; `QueryBuilder.php:883-894` cast `(int) $criterion['field']` ; direction forcée ASC/DESC ; `makeTextSearchValue` échappe `% _ \`. Tout est construit via `DBmysqlIterator::analyseCrit` (PDO). | **Aucune SQLi exploitable** |
+| **Inventaire agent (FusionInventory / GLPI Agent)** — `front/inventory.php`, `src/Glpi/Inventory/Request.php`, `Agent::handleAgent` | `handleAgent` utilise `getFromDBByCrit(['deviceid' => $value])` (ORM). XML parsé via `simplexml_load_string` sans `LIBXML_NOENT` (pas d'XXE). Schema validation avant persistence. | **CVE-2025-24799 bien corrigée — aucune SQLi** |
+| **REST API / HL API** — `apirest.php`, `src/Api/`, `src/Glpi/Api/HL/` | Search valide les critères contre SearchOption. `initSession` utilise l'ORM. Password reset compare tokens via GLPIKey. | **Aucune SQLi exploitable** |
+| **Preferences / Kanban / SavedSearch** (ex-CVE-2023-41320, 2023-41326, 2024-29889) | `DisplayPreference::updateOrder` paramétré. SavedSearch re-valide les critères au replay via `SearchOption`. | **Aucune SQLi exploitable** |
+| **Log exports** (GHSA-3m49-qf92-vccr) | `LogCsvExport` utilise `Log::convertFiltersValuesToSqlCriteria` qui valide et paramètre. | **Correctif appliqué** |
+
+### 8.2. Zones adjacentes encore à auditer dynamiquement
+
+Les agents n'ont pas prouvé de bug mais ont signalé ces zones comme méritant un PoC dynamique (fuzzing / burp) :
+
+1. **`SQLProvider::computeComplexJoinID` (lignes ~3845-3890)** — concaténation de `$joinparams['condition']`, `linkfield`, `tab['table']` avant `md5()`. Le hash neutralise l'impact SQL mais si l'un de ces paramètres fuit ailleurs sans md5 (ex. commentaire de debug, log), le motif d'injection existe.
+2. **`SQLProvider::getSelectCriteria` branche méta (~205-320)** — `$addtable` construit depuis `$opt["linkfield"]`. Si un plugin déclare une `SearchOption` avec `linkfield` non constant, injection possible.
+3. **`Agent::handleAgent` metadata passthrough** — `$metadata['tag']`, `$metadata['provider']['version']`, `$_SERVER['HTTP_USER_AGENT']` stockés puis rendus. Vérifier tous les `{{ ... }}` et `|raw` dans `templates/pages/admin/inventory/agent.html.twig` et dans `src/Glpi/Inventory/MainAsset/*.php` (stored XSS plutôt que SQLi).
+4. **HL API `src/Glpi/Api/HL/Search.php`** — surface neuve de 11.x. Le patch de CVE-2024-29889 a ciblé `src/Search.php` et `src/SavedSearch.php` ; un pattern de type "SensePost patch bypass" reste à tester sur la nouvelle implémentation HL.
+5. **Ecosystème plugins** — historiquement 50% des CVE GLPI proviennent des plugins (Formcreator, Behaviors, Genericobject, Fields). Audit hors scope de ce rapport.
+
+### 8.3. Conclusion SQLi
+
+**Par analyse statique sur GLPI 11.0.7 vanilla** : pas de PoC SQLi écrivable sans authentification ni avec un compte sans privilège. Le moteur Search est le vecteur historiquement le plus fragile et a été solidement hardené. Pour continuer la recherche d'un 0-day SQLi, les angles productifs sont :
+
+- **Dynamic fuzzing** (Burp Suite / sqlmap) contre `ajax/*.php` et `apirest.php` avec un compte self-service, en ciblant des encodages exotiques (JSON imbriqué, UTF-7, double-encoding URL) sur `sort`, `criteria[X][field]`, `itemtype`.
+- **Audit de plugins populaires** (Formcreator, GLPI-Inventory plugin, Fields) — ils étendent `SearchOption` et hooks sans toujours respecter les whitelists du core.
+- **Race conditions sur `Session::loadGroups()`** avec un IDP SSO/SAML compromis — vecteur pour activer la SQLi latente §2.1.
+- **Diff 11.0.6 → 11.0.7** sur les répertoires `src/Search/`, `src/Glpi/Api/HL/`, `src/Agent.php` pour repérer d'éventuelles régressions récentes.
+
